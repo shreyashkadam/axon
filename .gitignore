@@ -1,0 +1,19 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, build artifacts
+test.out
+/build
+/data
+kvstore
+kvstore.exe
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
