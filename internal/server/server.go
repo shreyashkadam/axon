@@ -2,18 +2,21 @@ package server
 
 import (
 	"github.com/gin-gonic/gin"
+	"kvstore/internal/store" // Temporary store, will be replaced by an interface
 )
 
 // Server holds all dependencies for the HTTP server.
 type Server struct {
+	store  *store.InMemoryStore // Temporary store
 	router *gin.Engine
 }
 
 // New creates a new Server instance.
-func New() *Server {
+func New(storage *store.InMemoryStore) *Server {
 	router := gin.Default()
 
 	s := &Server{
+		store:  storage,
 		router: router,
 	}
 
