@@ -9,7 +9,6 @@
 test.out
 /build
 /data
-kvstore
 kvstore.exe
 
 # Dependency directories
