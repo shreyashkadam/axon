@@ -2,8 +2,10 @@ package server
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/hashicorp/raft"
 )
 
 // KeyValue represents the JSON payload for a PUT request.
@@ -12,7 +14,6 @@ type KeyValue struct {
 }
 
 // putHandler handles storing a key-value pair.
-// It delegates to the cluster node if in cluster mode, otherwise writes locally.
 func (s *Server) putHandler(c *gin.Context) {
 	key := c.Param("key")
 	if key == "" {
@@ -93,7 +94,6 @@ func (s *Server) deleteHandler(c *gin.Context) {
 
 // getAllHandler retrieves all key-value pairs from the local store.
 func (s *Server) getAllHandler(c *gin.Context) {
-	// Note: This always queries the local node's store.
 	values, err := s.store.GetAll()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -106,4 +106,38 @@ func (s *Server) getAllHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+// --- Internal Cluster Handlers ---
+
+// RaftJoinRequest represents a request to join a Raft cluster.
+type RaftJoinRequest struct {
+	NodeID   string `json:"node_id"`
+	RaftAddr string `json:"raft_addr"`
+}
+
+// internalRaftJoinHandler handles requests from nodes to join the Raft cluster.
+func (s *Server) internalRaftJoinHandler(c *gin.Context) {
+	if s.node.GetRaft().State() != raft.Leader {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "not the leader"})
+		return
+	}
+
+	var req RaftJoinRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
+	if req.NodeID == "" || req.RaftAddr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "node_id and raft_addr are required"})
+		return
+	}
+
+	future := s.node.GetRaft().AddVoter(raft.ServerID(req.NodeID), raft.ServerAddress(req.RaftAddr), 0, 5*time.Second)
+	if err := future.Error(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to add voter: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "node successfully joined the Raft cluster"})
 }

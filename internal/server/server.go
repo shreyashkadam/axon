@@ -33,6 +33,7 @@ func New(storage store.Store, node *cluster.Node) *Server {
 
 // registerRoutes registers all the API routes.
 func (s *Server) registerRoutes() {
+	// Public API for key-value operations
 	v1 := s.router.Group("/kv")
 	{
 		v1.GET("/:key", s.getHandler)
@@ -43,7 +44,13 @@ func (s *Server) registerRoutes() {
 
 	// Internal API for node-to-node communication
 	if s.isCluster {
-		// Will be implemented later
+		internal := s.router.Group("/internal")
+		{
+			raftGroup := internal.Group("/raft")
+			{
+				raftGroup.POST("/join", s.internalRaftJoinHandler)
+			}
+		}
 	}
 }
 
