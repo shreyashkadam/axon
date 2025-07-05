@@ -2,7 +2,10 @@ module kvstore
 
 go 1.23.0
 
-require github.com/gin-gonic/gin v1.10.0
+require (
+	github.com/gin-gonic/gin v1.10.0
+	go.etcd.io/bbolt v1.4.0
+)
 
 require (
 	github.com/bytedance/sonic v1.13.2 // indirect
