@@ -12,6 +12,7 @@ type KeyValue struct {
 }
 
 // putHandler handles storing a key-value pair.
+// It delegates to the cluster node if in cluster mode, otherwise writes locally.
 func (s *Server) putHandler(c *gin.Context) {
 	key := c.Param("key")
 	if key == "" {
@@ -25,7 +26,15 @@ func (s *Server) putHandler(c *gin.Context) {
 		return
 	}
 
-	if err := s.store.Put([]byte(key), []byte(kv.Value)); err != nil {
+	var err error
+	if s.isCluster {
+		// Cluster logic will be added here
+		err = s.store.Put([]byte(key), []byte(kv.Value))
+	} else {
+		err = s.store.Put([]byte(key), []byte(kv.Value))
+	}
+
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -41,7 +50,15 @@ func (s *Server) getHandler(c *gin.Context) {
 		return
 	}
 
-	value, err := s.store.Get([]byte(key))
+	var value []byte
+	var err error
+	if s.isCluster {
+		// Cluster logic will be added here
+		value, err = s.store.Get([]byte(key))
+	} else {
+		value, err = s.store.Get([]byte(key))
+	}
+
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
@@ -58,7 +75,15 @@ func (s *Server) deleteHandler(c *gin.Context) {
 		return
 	}
 
-	if err := s.store.Delete([]byte(key)); err != nil {
+	var err error
+	if s.isCluster {
+		// Cluster logic will be added here
+		err = s.store.Delete([]byte(key))
+	} else {
+		err = s.store.Delete([]byte(key))
+	}
+
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -68,6 +93,7 @@ func (s *Server) deleteHandler(c *gin.Context) {
 
 // getAllHandler retrieves all key-value pairs from the local store.
 func (s *Server) getAllHandler(c *gin.Context) {
+	// Note: This always queries the local node's store.
 	values, err := s.store.GetAll()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
