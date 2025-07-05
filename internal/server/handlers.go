@@ -54,8 +54,7 @@ func (s *Server) getHandler(c *gin.Context) {
 	var value []byte
 	var err error
 	if s.isCluster {
-		// Cluster logic will be added in a later commit
-		value, err = s.store.Get([]byte(key))
+		value, err = s.node.Get([]byte(key))
 	} else {
 		value, err = s.store.Get([]byte(key))
 	}
@@ -78,8 +77,7 @@ func (s *Server) deleteHandler(c *gin.Context) {
 
 	var err error
 	if s.isCluster {
-		// Cluster logic will be added here
-		err = s.store.Delete([]byte(key))
+		err = s.node.Delete([]byte(key))
 	} else {
 		err = s.store.Delete([]byte(key))
 	}
@@ -94,6 +92,7 @@ func (s *Server) deleteHandler(c *gin.Context) {
 
 // getAllHandler retrieves all key-value pairs from the local store.
 func (s *Server) getAllHandler(c *gin.Context) {
+	// Note: This always queries the local node's store.
 	values, err := s.store.GetAll()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -118,9 +117,9 @@ func (s *Server) internalGetHandler(c *gin.Context) {
 		return
 	}
 
-	// This is a direct read from the local persistent store, not the Raft store.
-	// Used for replication in eventual consistency or follower reads.
-	value, err := s.store.Get([]byte(key))
+	// For strong consistency, a follower node forwards a GET to the leader,
+	// which then reads from its own Raft store. This is a direct read from that store.
+	value, err := s.node.GetRaftStore().Get([]byte(key))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
@@ -153,7 +152,6 @@ func (s *Server) internalVersionHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"version": version})
 }
-
 
 // RaftJoinRequest represents a request to join a Raft cluster.
 type RaftJoinRequest struct {

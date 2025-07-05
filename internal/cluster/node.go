@@ -306,6 +306,32 @@ func (n *Node) Put(key, value []byte) error {
 	return nil
 }
 
+func (n *Node) Get(key []byte) ([]byte, error) {
+	if n.IsLeader() {
+		return n.raftStore.Get(key)
+	}
+
+	leaderAddr := n.LeaderAddr()
+	if leaderAddr != "" {
+		return n.sendGetToLeader(leaderAddr, key)
+	}
+	return nil, fmt.Errorf("no leader available for strong consistency read")
+}
+
+func (n *Node) Delete(key []byte) error {
+	op := Operation{Type: OpDelete, Key: key}
+	opBytes, err := json.Marshal(op)
+	if err != nil {
+		return err
+	}
+
+	future := n.raft.Apply(opBytes, raftTimeout)
+	if err := future.Error(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (n *Node) sendPutToLeader(leaderAddr string, key, value []byte) error {
 	url := fmt.Sprintf("http://%s/kv/%s", leaderAddr, string(key))
 	reqBody := map[string]string{"value": string(value)}
@@ -332,6 +358,22 @@ func (n *Node) sendPutToLeader(leaderAddr string, key, value []byte) error {
 	}
 	return nil
 }
+
+func (n *Node) sendGetToLeader(nodeAddr string, key []byte) ([]byte, error) {
+	url := fmt.Sprintf("http://%s/internal/get/%s", nodeAddr, key)
+	resp, err := n.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to get key from node (status %d): %s", resp.StatusCode, string(body))
+	}
+	return ioutil.ReadAll(resp.Body)
+}
+
 
 func (n *Node) Shutdown() error {
 	if n.raft != nil {
