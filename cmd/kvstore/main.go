@@ -24,7 +24,6 @@ func main() {
 	nodeID := flag.String("node-id", "", "Node ID (defaults to localhost:<port>)")
 	peers := flag.String("peers", "", "Comma-separated list of peer addresses")
 	bindAddr := flag.String("bind-addr", "localhost", "Bind address for the node")
-
 	flag.Parse()
 
 	// Set default values
@@ -67,11 +66,16 @@ func main() {
 			BindAddr:     *bindAddr,
 			BindPort:     *port,
 			DataDir:      nodeDataDir,
-			ReplicaCount: 2, // Default, will be configurable later
+			ReplicaCount: 2,
 			KnownPeers:   peersList,
 		}
 
-		node, err = cluster.NewNode(nodeOpts)
+		fsm := cluster.NewFSM(persistentStore)
+		if fsm == nil {
+			log.Fatalf("Failed to create FSM with store")
+		}
+
+		node, err = cluster.NewNode(nodeOpts, fsm)
 		if err != nil {
 			log.Fatalf("Failed to initialize cluster node: %v", err)
 		}
