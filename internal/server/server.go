@@ -52,6 +52,7 @@ func (s *Server) registerRoutes() {
 			raftGroup := internal.Group("/raft")
 			{
 				raftGroup.POST("/join", s.internalRaftJoinHandler)
+				raftGroup.POST("/remove", s.internalRaftRemoveHandler)
 			}
 		}
 	}

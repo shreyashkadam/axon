@@ -1,6 +1,7 @@
 package server
 
 import (
+	"log"
 	"net/http"
 	"time"
 
@@ -188,4 +189,36 @@ func (s *Server) internalRaftJoinHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "node successfully joined the Raft cluster"})
+}
+
+// RaftRemoveRequest represents a request to remove a node from the Raft cluster.
+type RaftRemoveRequest struct {
+	NodeID string `json:"node_id"`
+}
+
+// internalRaftRemoveHandler handles requests to remove a node from the cluster.
+func (s *Server) internalRaftRemoveHandler(c *gin.Context) {
+	if !s.node.IsLeader() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "not the leader"})
+		return
+	}
+
+	var req RaftRemoveRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
+	if req.NodeID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "node_id is required"})
+		return
+	}
+
+	log.Printf("Leader received request to remove node %s from the cluster", req.NodeID)
+
+	future := s.node.GetRaft().RemoveServer(raft.ServerID(req.NodeID), 0, 0)
+	if err := future.Error(); err != nil {
+		log.Printf("Warning/Error removing server %s: %v", req.NodeID, err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "removal processed"})
 }

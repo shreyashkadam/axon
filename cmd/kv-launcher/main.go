@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -22,9 +23,10 @@ const portStep = 10
 
 // NodeConfig holds the configuration for a single kvstore node.
 type NodeConfig struct {
-	ID      string `json:"id"`
-	APIPort int    `json:"api_port"`
+	ID       string `json:"id"`
+	APIPort  int    `json:"api_port"`
 	BindAddr string `json:"-"`
+	DataDir  string `json:"-"`
 }
 
 // NodeProcess holds the state for a running node process.
@@ -54,7 +56,6 @@ func NewNodeManager(kvBinary string) *NodeManager {
 }
 
 func (nm *NodeManager) findFreePort() (int, error) {
-	// Simplified port finding
 	port := nm.nextBasePort
 	nm.nextBasePort += portStep
 	return port, nil
@@ -77,6 +78,7 @@ func (nm *NodeManager) AddNewNode(nodeID string) (NodeConfig, error) {
 		ID:       nodeID,
 		APIPort:  apiPort,
 		BindAddr: "127.0.0.1",
+		DataDir:  fmt.Sprintf("./data/%s", nodeID),
 	}
 
 	nm.allConfigs[config.ID] = config
@@ -94,9 +96,8 @@ func (nm *NodeManager) startNode(config NodeConfig, bootstrap bool, joinPeer str
 		return fmt.Errorf("node %s is already running", config.ID)
 	}
 
-	dataDir := fmt.Sprintf("./data/%s", config.ID)
-	_ = os.RemoveAll(dataDir)
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	_ = os.RemoveAll(config.DataDir)
+	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
 		return fmt.Errorf("failed to create data directory for %s: %w", config.ID, err)
 	}
 
@@ -105,7 +106,7 @@ func (nm *NodeManager) startNode(config NodeConfig, bootstrap bool, joinPeer str
 	args := []string{
 		"--port", fmt.Sprintf("%d", config.APIPort),
 		"--node-id", config.ID,
-		"--data-dir", dataDir,
+		"--data-dir", config.DataDir,
 		"--cluster-mode",
 		"--bind-addr", config.BindAddr,
 	}
@@ -155,6 +156,34 @@ func (nm *NodeManager) StopNode(nodeID string) error {
 			_ = proc.Cmd.Process.Kill()
 		}
 	}
+	return nil
+}
+
+func (nm *NodeManager) DecommissionNode(nodeID string) error {
+	nm.mu.Lock()
+	log.Printf("Decommissioning node %s...", nodeID)
+
+	delete(nm.allConfigs, nodeID)
+
+	_, isRunning := nm.nodes[nodeID]
+	nm.mu.Unlock()
+
+	if isRunning {
+		leaderAPIAddr, err := nm.FindCurrentLeader()
+		if err == nil && leaderAPIAddr != "" {
+			log.Printf("Found leader at %s. Requesting removal of node %s.", leaderAPIAddr, nodeID)
+
+			reqBody, _ := json.Marshal(map[string]string{"node_id": nodeID})
+			removeURL := fmt.Sprintf("http://%s/internal/raft/remove", leaderAPIAddr)
+			_, _ = nm.httpClient.Post(removeURL, "application/json", bytes.NewBuffer(reqBody))
+			time.Sleep(1 * time.Second)
+		}
+		_ = nm.StopNode(nodeID)
+	}
+
+	dataDir := fmt.Sprintf("./data/%s", nodeID)
+	_ = os.RemoveAll(dataDir)
+
 	return nil
 }
 
@@ -329,6 +358,13 @@ func main() {
 			}
 			go manager.startNewNodeProcess(config)
 			c.JSON(http.StatusOK, gin.H{"status": "start signal sent"})
+		})
+		api.POST("/delete/:nodeID", func(c *gin.Context) {
+			if err := manager.DecommissionNode(c.Param("nodeID")); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "decommissioned"})
 		})
 	}
 
