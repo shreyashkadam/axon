@@ -47,13 +47,18 @@ func (s *InMemoryStore) Delete(key []byte) error {
 
 // GetAll retrieves all key-value pairs.
 func (s *InMemoryStore) GetAll() (map[string][]byte, error) {
-    s.mu.RLock()
-    defer s.mu.RUnlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-    // Return a copy to prevent race conditions on the caller's side
-    dataCopy := make(map[string][]byte, len(s.data))
-    for k, v := range s.data {
-        dataCopy[k] = v
-    }
-    return dataCopy, nil
+	// Return a copy to prevent race conditions on the caller's side
+	dataCopy := make(map[string][]byte, len(s.data))
+	for k, v := range s.data {
+		dataCopy[k] = v
+	}
+	return dataCopy, nil
+}
+
+// Close is a no-op for the in-memory store.
+func (s *InMemoryStore) Close() error {
+	return nil
 }
