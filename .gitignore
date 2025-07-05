@@ -1,3 +1,29 @@
+# ----------------------------------------------------------------
+# General
+# ----------------------------------------------------------------
+# IDE and editor specific files
+.vscode/
+.idea/
+
+# Operating System generated files
+.DS_Store
+
+# Environment variables
+.env
+.env.*
+# But do not ignore the example file
+!/.env.example
+
+
+# ----------------------------------------------------------------
+# Go
+# ----------------------------------------------------------------
+# Go workspace file
+go.work
+
+# Go dependency directory (if you use it)
+vendor/
+
 # Binaries for programs and plugins
 *.exe
 *.exe~
@@ -5,14 +31,27 @@
 *.so
 *.dylib
 
-# Test binary, build artifacts
+# Test binary
 test.out
-/build
-/data
+
+# Go build artifacts and local data
+kvstore
 kvstore.exe
+/data/
+*.db
 
-# Dependency directories
-vendor/
 
-# Go workspace file
-go.work
+# ----------------------------------------------------------------
+# SvelteKit & Node.js
+# ----------------------------------------------------------------
+# Node dependencies
+ui-svelte/node_modules/
+
+# SvelteKit build and temporary directories
+cmd/kv-launcher/build/
+ui-svelte/.svelte-kit/
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

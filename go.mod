@@ -6,12 +6,12 @@ go 1.23.0
 replace golang.org/x/net => golang.org/x/net v0.17.0
 
 require (
+	github.com/gin-contrib/cors v1.7.2
 	github.com/gin-gonic/gin v1.10.0
 	github.com/hashicorp/memberlist v0.5.3
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	go.etcd.io/bbolt v1.4.0
-	github.com/gin-contrib/cors v1.7.2
 )
 
 require (
