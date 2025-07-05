@@ -1,5 +1,5 @@
 <script>
-   import { onMount } from 'svelte';
+  import { onMount } from 'svelte';
   import { getManagedNodes } from '$lib/api.js';
   import ClusterDashboard from '$lib/components/ClusterDashboard.svelte';
   import KeyValueExplorer from '$lib/components/KeyValueExplorer.svelte';
