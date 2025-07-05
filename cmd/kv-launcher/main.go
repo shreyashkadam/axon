@@ -83,8 +83,7 @@ func (nm *NodeManager) AddNewNode(nodeID string) (NodeConfig, error) {
 
 	nm.allConfigs[config.ID] = config
 
-	go nm.startNewNodeProcess(config)
-
+	go nm.startNodeWithRecovery(config)
 	return config, nil
 }
 
@@ -275,6 +274,59 @@ func (nm *NodeManager) GetAllNodeStatuses() map[string]interface{} {
 	return statuses
 }
 
+func (nm *NodeManager) startNodeWithRecovery(config NodeConfig) {
+	joinPeer, err := nm.FindCurrentLeader()
+	forceBootstrap := false
+
+	// If there is no active leader...
+	if err != nil {
+		log.Printf("No active leader found for node %s. Checking existing configuration...", config.ID)
+		nm.mu.RLock()
+		
+		// Check if any other nodes are part of the overall configuration.
+		// We use `len(nm.allConfigs) > 1` because allConfigs includes the node we are currently starting.
+		// If it's greater than 1, it means other nodes exist or have existed.
+		isExistingCluster := len(nm.allConfigs) > 1
+		nm.mu.RUnlock()
+
+		// If other nodes are part of the configuration, this node should NOT bootstrap.
+		// It must try to join an existing peer. This prevents a split-brain.
+		// The cluster must be recovered by restarting one of the *original* nodes.
+		if isExistingCluster {
+			log.Printf("An existing cluster configuration was found but has no leader (lost quorum).")
+			log.Printf("Node %s will NOT bootstrap. It will attempt to join the old cluster.", config.ID)
+			
+			// Find an original peer to try and join.
+			nm.mu.RLock()
+			for _, existingConfig := range nm.allConfigs {
+				if existingConfig.ID != config.ID {
+					joinPeer = fmt.Sprintf("%s:%d", existingConfig.BindAddr, existingConfig.APIPort)
+					log.Printf("Setting join peer for %s to %s", config.ID, joinPeer)
+					break
+				}
+			}
+			nm.mu.RUnlock()
+
+            // If for some reason we couldn't find a peer to join, log an error.
+            if joinPeer == "" {
+                log.Printf("CRITICAL: Could not find a peer for node %s to join in an existing cluster.", config.ID)
+            }
+
+		} else {
+			// This is the very first node being added to an empty system. It's safe to bootstrap.
+			log.Printf("This appears to be the first node in the system. Node %s will bootstrap as leader.", config.ID)
+			forceBootstrap = true
+		}
+	}
+
+	if err := nm.startNode(config, forceBootstrap, joinPeer); err != nil {
+		log.Printf("ERROR starting node %s: %v", config.ID, err)
+		nm.mu.Lock()
+		delete(nm.allConfigs, config.ID)
+		nm.mu.Unlock()
+	}
+}
+
 func (nm *NodeManager) StopAll() {
 	nm.mu.Lock()
 	nodeIDs := make([]string, 0, len(nm.nodes))
@@ -311,7 +363,7 @@ func main() {
 			log.Fatalf("Failed to create initial node: %v", err)
 		}
 		if i == 1 {
-			time.Sleep(5 * time.Second)
+			time.Sleep(5 * time.Second) // Give leader time to establish
 		} else {
 			time.Sleep(2 * time.Second)
 		}
@@ -356,7 +408,7 @@ func main() {
 				c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
 				return
 			}
-			go manager.startNewNodeProcess(config)
+			go manager.startNodeWithRecovery(config) // Use the new recovery logic
 			c.JSON(http.StatusOK, gin.H{"status": "start signal sent"})
 		})
 		api.POST("/delete/:nodeID", func(c *gin.Context) {
