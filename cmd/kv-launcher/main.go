@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,15 +21,19 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+//go:embed all:build
+var uiAssets embed.FS
+
 const basePort = 9000
 const portStep = 10
 
 // NodeConfig holds the configuration for a single kvstore node.
 type NodeConfig struct {
-	ID       string `json:"id"`
-	APIPort  int    `json:"api_port"`
+	ID      string `json:"id"`
+	APIPort int    `json:"api_port"`
+	RaftPort int    `json:"-"`
 	BindAddr string `json:"-"`
-	DataDir  string `json:"-"`
+	DataDir string `json:"-"`
 }
 
 // NodeProcess holds the state for a running node process.
@@ -55,10 +62,35 @@ func NewNodeManager(kvBinary string) *NodeManager {
 	}
 }
 
-func (nm *NodeManager) findFreePort() (int, error) {
-	port := nm.nextBasePort
-	nm.nextBasePort += portStep
-	return port, nil
+func (nm *NodeManager) findFreePorts() (int, int, int, error) {
+	for i := 0; i < 100; i++ {
+		apiPort := nm.nextBasePort
+		memberlistPort := apiPort + 1
+		raftPort := apiPort + 2
+		nm.nextBasePort += portStep
+
+		l1, err1 := net.Listen("tcp", fmt.Sprintf(":%d", apiPort))
+		if err1 != nil {
+			continue
+		}
+		l2, err2 := net.Listen("tcp", fmt.Sprintf(":%d", memberlistPort))
+		if err2 != nil {
+			l1.Close()
+			continue
+		}
+		l3, err3 := net.Listen("tcp", fmt.Sprintf(":%d", raftPort))
+		if err3 != nil {
+			l1.Close()
+			l2.Close()
+			continue
+		}
+
+		l1.Close()
+		l2.Close()
+		l3.Close()
+		return apiPort, memberlistPort, raftPort, nil
+	}
+	return 0, 0, 0, fmt.Errorf("could not find 3 consecutive free ports")
 }
 
 func (nm *NodeManager) AddNewNode(nodeID string) (NodeConfig, error) {
@@ -69,14 +101,15 @@ func (nm *NodeManager) AddNewNode(nodeID string) (NodeConfig, error) {
 		return NodeConfig{}, fmt.Errorf("node with ID %s already exists", nodeID)
 	}
 
-	apiPort, err := nm.findFreePort()
+	apiPort, _, raftPort, err := nm.findFreePorts()
 	if err != nil {
-		return NodeConfig{}, fmt.Errorf("failed to allocate port: %w", err)
+		return NodeConfig{}, fmt.Errorf("failed to allocate ports: %w", err)
 	}
 
 	config := NodeConfig{
 		ID:       nodeID,
 		APIPort:  apiPort,
+		RaftPort: raftPort,
 		BindAddr: "127.0.0.1",
 		DataDir:  fmt.Sprintf("./data/%s", nodeID),
 	}
@@ -84,10 +117,11 @@ func (nm *NodeManager) AddNewNode(nodeID string) (NodeConfig, error) {
 	nm.allConfigs[config.ID] = config
 
 	go nm.startNodeWithRecovery(config)
+
 	return config, nil
 }
 
-func (nm *NodeManager) startNode(config NodeConfig, bootstrap bool, joinPeer string) error {
+func (nm *NodeManager) startNode(config NodeConfig, forceBootstrap bool, joinPeer string) error {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 
@@ -107,10 +141,11 @@ func (nm *NodeManager) startNode(config NodeConfig, bootstrap bool, joinPeer str
 		"--node-id", config.ID,
 		"--data-dir", config.DataDir,
 		"--cluster-mode",
+		"--consistency", "strong",
 		"--bind-addr", config.BindAddr,
 	}
 
-	if bootstrap {
+	if forceBootstrap {
 		args = append(args, "--bootstrap-leader")
 	} else if joinPeer != "" {
 		args = append(args, "--join-peer", joinPeer)
@@ -222,58 +257,6 @@ func (nm *NodeManager) FindCurrentLeader() (string, error) {
 	return "", fmt.Errorf("could not determine leader")
 }
 
-func (nm *NodeManager) startNewNodeProcess(config NodeConfig) {
-	joinPeer, err := nm.FindCurrentLeader()
-	bootstrap := false
-	if err != nil {
-		log.Printf("Could not find leader. This node might bootstrap if it's the first one.")
-		nm.mu.RLock()
-		if len(nm.allConfigs) == 1 {
-			bootstrap = true
-		}
-		nm.mu.RUnlock()
-	}
-
-	if err := nm.startNode(config, bootstrap, joinPeer); err != nil {
-		log.Printf("ERROR starting node %s: %v", config.ID, err)
-		nm.mu.Lock()
-		delete(nm.allConfigs, config.ID)
-		nm.mu.Unlock()
-	}
-}
-
-func (nm *NodeManager) GetAllNodeStatuses() map[string]interface{} {
-	nm.mu.RLock()
-	defer nm.mu.RUnlock()
-
-	statuses := make(map[string]interface{})
-	for id, cfg := range nm.allConfigs {
-		baseStatus := map[string]interface{}{
-			"id":        id,
-			"api_port":  cfg.APIPort,
-			"status":    "offline",
-			"is_leader": false,
-		}
-
-		if _, running := nm.nodes[id]; running {
-			url := fmt.Sprintf("http://%s:%d/internal/status", cfg.BindAddr, cfg.APIPort)
-			resp, err := nm.httpClient.Get(url)
-			if err == nil {
-				defer resp.Body.Close()
-				var raftStatus struct {
-					IsLeader bool `json:"is_leader"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&raftStatus) == nil {
-					baseStatus["status"] = "online"
-					baseStatus["is_leader"] = raftStatus.IsLeader
-				}
-			}
-		}
-		statuses[id] = baseStatus
-	}
-	return statuses
-}
-
 func (nm *NodeManager) startNodeWithRecovery(config NodeConfig) {
 	joinPeer, err := nm.FindCurrentLeader()
 	forceBootstrap := false
@@ -319,12 +302,45 @@ func (nm *NodeManager) startNodeWithRecovery(config NodeConfig) {
 		}
 	}
 
+	// This logic remains the same. If a leader was found, joinPeer is already set and this block is skipped.
 	if err := nm.startNode(config, forceBootstrap, joinPeer); err != nil {
 		log.Printf("ERROR starting node %s: %v", config.ID, err)
 		nm.mu.Lock()
 		delete(nm.allConfigs, config.ID)
 		nm.mu.Unlock()
 	}
+}
+
+func (nm *NodeManager) GetAllNodeStatuses() map[string]interface{} {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	statuses := make(map[string]interface{})
+	for id, cfg := range nm.allConfigs {
+		baseStatus := map[string]interface{}{
+			"id":        id,
+			"api_port":  cfg.APIPort,
+			"status":    "offline",
+			"is_leader": false,
+		}
+
+		if _, running := nm.nodes[id]; running {
+			url := fmt.Sprintf("http://%s:%d/internal/status", cfg.BindAddr, cfg.APIPort)
+			resp, err := nm.httpClient.Get(url)
+			if err == nil {
+				defer resp.Body.Close()
+				var raftStatus struct {
+					IsLeader bool `json:"is_leader"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&raftStatus) == nil {
+					baseStatus["status"] = "online"
+					baseStatus["is_leader"] = raftStatus.IsLeader
+				}
+			}
+		}
+		statuses[id] = baseStatus
+	}
+	return statuses
 }
 
 func (nm *NodeManager) StopAll() {
@@ -340,14 +356,33 @@ func (nm *NodeManager) StopAll() {
 	}
 }
 
+// spaHandler serves the single-page application.
+type spaHandler struct {
+	staticFS fs.FS
+}
+
+func (h spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+
+	if _, err := h.staticFS.Open(strings.TrimPrefix(path, "/")); err == nil {
+		http.FileServer(http.FS(h.staticFS)).ServeHTTP(w, r)
+		return
+	}
+
+	r.URL.Path = "/"
+	http.FileServer(http.FS(h.staticFS)).ServeHTTP(w, r)
+}
+
 func main() {
 	kvstoreBinaryName := "kvstore"
 	if runtime.GOOS == "windows" {
 		kvstoreBinaryName += ".exe"
 	}
-	_ = os.Remove(kvstoreBinaryName)
+	_ = os.Remove("kvstore.exe")
+	_ = os.Remove("kvstore")
 
 	log.Println("Building kvstore binary...")
+	// *** UPDATED BUILD COMMAND ***
 	buildCmd := exec.Command("go", "build", "-o", kvstoreBinaryName, "./cmd/kvstore")
 	if output, err := buildCmd.CombinedOutput(); err != nil {
 		log.Fatalf("Failed to build kvstore binary: %v\n%s", err, string(output))
@@ -363,7 +398,7 @@ func main() {
 			log.Fatalf("Failed to create initial node: %v", err)
 		}
 		if i == 1 {
-			time.Sleep(5 * time.Second) // Give leader time to establish
+			time.Sleep(5 * time.Second)
 		} else {
 			time.Sleep(2 * time.Second)
 		}
@@ -408,7 +443,7 @@ func main() {
 				c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
 				return
 			}
-			go manager.startNodeWithRecovery(config) // Use the new recovery logic
+			go manager.startNodeWithRecovery(config)
 			c.JSON(http.StatusOK, gin.H{"status": "start signal sent"})
 		})
 		api.POST("/delete/:nodeID", func(c *gin.Context) {
@@ -420,10 +455,19 @@ func main() {
 		})
 	}
 
-	server := &http.Server{Addr: ":8080", Handler: apiRouter}
+	svelteBuildFS, err := fs.Sub(uiAssets, "build")
+	if err != nil {
+		log.Fatalf("Failed to create sub filesystem for UI: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/api/control/", apiRouter)
+	mux.Handle("/", spaHandler{staticFS: svelteBuildFS})
+
+	server := &http.Server{Addr: ":8080", Handler: mux}
 
 	go func() {
-		log.Println("Launcher API running at http://localhost:8080")
+		log.Println("Launcher UI running at http://localhost:8080")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %s\n", err)
 		}

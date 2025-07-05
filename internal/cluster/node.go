@@ -16,14 +16,17 @@ import (
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+
 	"kvstore/internal/consistent"
+	"kvstore/internal/store"
 )
 
 const (
-	raftTimeout      = 10 * time.Second
-	raftRetainSnaps  = 2
-	raftMaxPool      = 3
-	raftTransTimeout = 10 * time.Second
+	raftTimeout         = 10 * time.Second
+	raftRetainSnaps     = 2
+	raftMaxPool         = 3
+	raftTransTimeout    = 10 * time.Second
+	defaultReplicaCount = 3
 )
 
 // Node represents a node in the distributed key-value store
@@ -46,6 +49,9 @@ type Node struct {
 	httpClient    *http.Client
 	dataDir       string
 	replicaCount  int
+	consistency   string
+	quorumReads   bool
+	quorumWrites  bool
 }
 
 // NodeOptions contains options for creating a new node
@@ -55,7 +61,10 @@ type NodeOptions struct {
 	BindPort      int
 	DataDir       string
 	ReplicaCount  int
+	Consistency   string
 	KnownPeers    []string
+	QuorumReads   bool
+	QuorumWrites  bool
 	BootstrapRaft bool
 	JoinPeer      string
 }
@@ -66,13 +75,23 @@ func NewNode(opts NodeOptions, fsm *FSM) (*Node, error) {
 		return nil, fmt.Errorf("fsm cannot be nil")
 	}
 
+	if opts.ReplicaCount <= 0 {
+		opts.ReplicaCount = defaultReplicaCount
+	}
+	if opts.Consistency == "" {
+		opts.Consistency = "strong"
+	}
+
 	node := &Node{
-		ID:           opts.ID,
-		BindAddr:     opts.BindAddr,
-		BindPort:     opts.BindPort,
-		dataDir:      opts.DataDir,
-		replicaCount: opts.ReplicaCount,
-		hashRing:     consistent.NewRing(10),
+		ID:            opts.ID,
+		BindAddr:      opts.BindAddr,
+		BindPort:      opts.BindPort,
+		dataDir:       opts.DataDir,
+		replicaCount:  opts.ReplicaCount,
+		consistency:   opts.Consistency,
+		quorumReads:   opts.QuorumReads,
+		quorumWrites:  opts.QuorumWrites,
+		hashRing:      consistent.NewRing(10),
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
@@ -117,12 +136,23 @@ func (n *Node) setupMemberlist(knownPeers []string) error {
 	n.hashRing.AddNode(nodeAddr)
 	log.Printf("Added self to hash ring: %s", nodeAddr)
 
+	for _, port := range []int{8000, 8010, 8020} {
+		if port != n.BindPort {
+			peerAddr := fmt.Sprintf("localhost:%d", port)
+			n.hashRing.AddNode(peerAddr)
+			log.Printf("Added known peer to hash ring: %s", peerAddr)
+		}
+	}
+
 	if len(knownPeers) > 0 {
 		_, err = ml.Join(knownPeers)
 		if err != nil {
 			log.Printf("Failed to join cluster: %v", err)
 		}
 	}
+
+	nodes := n.hashRing.GetAllNodes()
+	log.Printf("Nodes in hash ring after setup: %v", nodes)
 
 	return nil
 }
@@ -195,6 +225,9 @@ func (n *Node) setupRaft(fsm *FSM) error {
 			log.Printf("Successfully bootstrapped Raft cluster as leader")
 		}
 	} else if n.JoinPeer != "" {
+		// =================================================================
+		// START OF BUG FIX: Implement a persistent retry loop for joining.
+		// =================================================================
 		go func() {
 			log.Printf("Node %s starting join process to peer %s", n.ID, n.JoinPeer)
 			ticker := time.NewTicker(5 * time.Second) // Retry every 5 seconds
@@ -219,52 +252,13 @@ func (n *Node) setupRaft(fsm *FSM) error {
 				}
 			}
 		}()
+		// =================================================================
+		// END OF BUG FIX
+		// =================================================================
 	}
 
 	log.Printf("Raft setup complete for node %s", n.ID)
 	return nil
-}
-
-func (n *Node) joinRaftCluster(peerAddr string) error {
-	localRaftAddr := fmt.Sprintf("%s:%d", n.BindAddr, n.BindPort+2)
-	joinRequest := struct {
-		NodeID   string `json:"node_id"`
-		RaftAddr string `json:"raft_addr"`
-	}{
-		NodeID:   n.ID,
-		RaftAddr: localRaftAddr,
-	}
-
-	joinData, err := json.Marshal(joinRequest)
-	if err != nil {
-		return fmt.Errorf("failed to marshal join request: %w", err)
-	}
-
-	joinURL := fmt.Sprintf("http://%s/internal/raft/join", peerAddr)
-	resp, err := n.httpClient.Post(joinURL, "application/json", bytes.NewBuffer(joinData))
-	if err != nil {
-		return fmt.Errorf("failed to send join request to %s: %w", peerAddr, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		return nil // Success!
-	}
-
-	// If we were redirected, we need to update our JoinPeer to the new leader address.
-	if resp.StatusCode == http.StatusTemporaryRedirect {
-		var redirectInfo struct {
-			LeaderAddr string `json:"leader_addr"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&redirectInfo); err == nil && redirectInfo.LeaderAddr != "" {
-			log.Printf("Join target %s is not leader. Redirected to leader at %s.", peerAddr, redirectInfo.LeaderAddr)
-			n.JoinPeer = redirectInfo.LeaderAddr // Update so the next retry hits the correct leader.
-			return fmt.Errorf("redirected to new leader: %s", redirectInfo.LeaderAddr)
-		}
-	}
-
-	body, _ := ioutil.ReadAll(resp.Body)
-	return fmt.Errorf("join request to %s failed with status %d: %s", peerAddr, resp.StatusCode, string(body))
 }
 
 func (n *Node) IsLeader() bool {
@@ -306,62 +300,290 @@ func (n *Node) GetRaftStore() *RaftStore {
 	return n.raftStore
 }
 
+type VersionedResponse struct {
+	Value   []byte `json:"value"`
+	Version uint64 `json:"version"`
+}
+
 func (n *Node) Put(key, value []byte) error {
 	log.Printf("Put request for key: %s", string(key))
 
-	if !n.IsLeader() {
+	if n.consistency == "strong" {
+		log.Printf("Using strong consistency for key %s", string(key))
+		isLeader := n.IsLeader()
 		leaderAddr := n.LeaderAddr()
-		if leaderAddr == "" {
-			return fmt.Errorf("no leader available for put")
+		log.Printf("Local node leader status: %v, Leader address: %s", isLeader, leaderAddr)
+
+		if !isLeader {
+			if leaderAddr == "" {
+				return fmt.Errorf("no leader available for strong consistency put")
+			}
+			log.Printf("Forwarding put request to leader at %s", leaderAddr)
+			return n.sendPut(leaderAddr, key, value)
 		}
-		log.Printf("Forwarding put request to leader at %s", leaderAddr)
-		return n.sendPutToLeader(leaderAddr, key, value)
+
+		log.Printf("We are the Raft leader, storing key %s via Raft consensus", string(key))
+		op := Operation{Type: OpPut, Key: key, Value: value}
+		opData, err := json.Marshal(op)
+		if err != nil {
+			return fmt.Errorf("failed to marshal operation: %w", err)
+		}
+
+		applyFuture := n.raft.Apply(opData, raftTimeout)
+		if err := applyFuture.Error(); err != nil {
+			log.Printf("Failed to apply operation to Raft: %v", err)
+			return fmt.Errorf("failed to apply operation to Raft: %w", err)
+		}
+		log.Printf("Successfully stored key %s with strong consistency", string(key))
+		return nil
 	}
 
-	log.Printf("We are the Raft leader, storing key %s via Raft consensus", string(key))
-	op := Operation{Type: OpPut, Key: key, Value: value}
-	opData, err := json.Marshal(op)
+	log.Printf("Using eventual consistency for key %s", string(key))
+	if err := n.localPut(key, value); err != nil {
+		log.Printf("Failed to store key %s locally: %v", string(key), err)
+	}
+
+	nodeAddrs, err := n.hashRing.GetNodes(key, n.replicaCount)
 	if err != nil {
-		return fmt.Errorf("failed to marshal operation: %w", err)
+		return err
 	}
 
-	applyFuture := n.raft.Apply(opData, raftTimeout)
-	if err := applyFuture.Error(); err != nil {
-		log.Printf("Failed to apply operation to Raft: %v", err)
-		return fmt.Errorf("failed to apply operation to Raft: %w", err)
+	successCount := 0
+	var lastErr error
+	for _, nodeAddr := range nodeAddrs {
+		selfAddr := fmt.Sprintf("%s:%d", n.BindAddr, n.BindPort)
+		if nodeAddr == selfAddr {
+			successCount++
+			continue
+		}
+		if err := n.sendPut(nodeAddr, key, value); err != nil {
+			lastErr = err
+			continue
+		}
+		successCount++
 	}
-	log.Printf("Successfully stored key %s", string(key))
+
+	if n.quorumWrites && successCount < (n.replicaCount/2+1) {
+		return fmt.Errorf("failed to achieve write quorum: %w", lastErr)
+	}
+	if successCount == 0 {
+		return fmt.Errorf("failed to write to any node: %w", lastErr)
+	}
 	return nil
 }
 
-func (n *Node) Get(key []byte) ([]byte, error) {
-	if n.IsLeader() {
-		return n.raftStore.Get(key)
+func (n *Node) localPut(key, value []byte) error {
+	s, err := store.NewPersistentStore(filepath.Join(n.dataDir, fmt.Sprintf("data_%d.db", n.BindPort)))
+	if err != nil {
+		return fmt.Errorf("failed to open store: %w", err)
+	}
+	defer s.Close()
+	return s.Put(key, value)
+}
+
+func (n *Node) getVersionedRead(key []byte, leaderAddr string) ([]byte, uint64, error) {
+	value, version, err := n.raftStore.GetVersioned(key)
+	if err != nil {
+		return nil, 0, err
 	}
 
-	leaderAddr := n.LeaderAddr()
-	if leaderAddr != "" {
-		return n.sendGetToLeader(leaderAddr, key)
+	leaderVersion, err := n.getKeyVersionFromLeader(key, leaderAddr)
+	if err != nil {
+		return nil, 0, err
 	}
-	return nil, fmt.Errorf("no leader available for strong consistency read")
+
+	if version >= leaderVersion {
+		return value, version, nil
+	}
+
+	return nil, 0, fmt.Errorf("local version outdated")
+}
+
+func (n *Node) getKeyVersionFromLeader(key []byte, leaderAddr string) (uint64, error) {
+	url := fmt.Sprintf("http://%s/internal/version/%s", leaderAddr, string(key))
+	resp, err := n.httpClient.Get(url)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get version from leader: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return 0, fmt.Errorf("got error from leader: %s (status %d)", body, resp.StatusCode)
+	}
+
+	var versionResp struct {
+		Version uint64 `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&versionResp); err != nil {
+		return 0, fmt.Errorf("failed to decode version response: %w", err)
+	}
+	return versionResp.Version, nil
+}
+
+func (n *Node) Get(key []byte) ([]byte, error) {
+	if n.consistency == "strong" {
+		if n.IsLeader() {
+			return n.raftStore.Get(key)
+		}
+
+		leaderAddr := n.LeaderAddr()
+		if leaderAddr != "" {
+			value, _, err := n.getVersionedRead(key, leaderAddr)
+			if err == nil {
+				return value, nil
+			}
+			return n.sendGet(leaderAddr, key)
+		}
+		return nil, fmt.Errorf("no leader available for strong consistency read")
+	}
+
+	localValue, err := n.localGet(key)
+	if err == nil {
+		return localValue, nil
+	}
+
+	responsibleNodes, err := n.hashRing.GetNodes(key, n.replicaCount)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, nodeAddr := range responsibleNodes {
+		selfAddr := fmt.Sprintf("%s:%d", n.BindAddr, n.BindPort)
+		if nodeAddr == selfAddr {
+			continue
+		}
+		value, err := n.sendGet(nodeAddr, key)
+		if err == nil {
+			return value, nil
+		}
+	}
+	return nil, fmt.Errorf("key not found or all nodes unavailable")
+}
+
+func (n *Node) localGet(key []byte) ([]byte, error) {
+	s, err := store.NewPersistentStore(filepath.Join(n.dataDir, fmt.Sprintf("data_%d.db", n.BindPort)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to open store: %w", err)
+	}
+	defer s.Close()
+	return s.Get(key)
 }
 
 func (n *Node) Delete(key []byte) error {
+	nodeAddrs, err := n.hashRing.GetNodes(key, n.replicaCount)
+	if err != nil {
+		return err
+	}
+
 	op := Operation{Type: OpDelete, Key: key}
 	opBytes, err := json.Marshal(op)
 	if err != nil {
 		return err
 	}
 
-	future := n.raft.Apply(opBytes, raftTimeout)
-	if err := future.Error(); err != nil {
-		return err
+	if n.consistency == "strong" || n.quorumWrites {
+		future := n.raft.Apply(opBytes, raftTimeout)
+		if err := future.Error(); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	successCount := 0
+	var lastErr error
+	for _, nodeAddr := range nodeAddrs {
+		if err := n.sendOperation(nodeAddr, op); err != nil {
+			lastErr = err
+			continue
+		}
+		successCount++
+	}
+
+	if n.quorumWrites && successCount < (n.replicaCount/2+1) {
+		return fmt.Errorf("failed to achieve write quorum: %w", lastErr)
+	}
+	if successCount == 0 {
+		return fmt.Errorf("failed to delete from any node: %w", lastErr)
 	}
 	return nil
 }
 
-func (n *Node) sendPutToLeader(leaderAddr string, key, value []byte) error {
-	url := fmt.Sprintf("http://%s/kv/%s", leaderAddr, string(key))
+// =================================================================
+// START OF BUG FIX: Smarter join logic that handles redirects.
+// =================================================================
+func (n *Node) joinRaftCluster(peerAddr string) error {
+	localRaftAddr := fmt.Sprintf("%s:%d", n.BindAddr, n.BindPort+2)
+	joinRequest := struct {
+		NodeID   string `json:"node_id"`
+		RaftAddr string `json:"raft_addr"`
+	}{
+		NodeID:   n.ID,
+		RaftAddr: localRaftAddr,
+	}
+
+	joinData, err := json.Marshal(joinRequest)
+	if err != nil {
+		return fmt.Errorf("failed to marshal join request: %w", err)
+	}
+
+	joinURL := fmt.Sprintf("http://%s/internal/raft/join", peerAddr)
+	resp, err := n.httpClient.Post(joinURL, "application/json", bytes.NewBuffer(joinData))
+	if err != nil {
+		return fmt.Errorf("failed to send join request to %s: %w", peerAddr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return nil // Success!
+	}
+
+	// If we were redirected, we need to update our JoinPeer to the new leader address.
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		var redirectInfo struct {
+			LeaderAddr string `json:"leader_addr"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&redirectInfo); err == nil && redirectInfo.LeaderAddr != "" {
+			log.Printf("Join target %s is not leader. Redirected to leader at %s.", peerAddr, redirectInfo.LeaderAddr)
+			n.JoinPeer = redirectInfo.LeaderAddr // Update so the next retry hits the correct leader.
+			return fmt.Errorf("redirected to new leader: %s", redirectInfo.LeaderAddr)
+		}
+	}
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	return fmt.Errorf("join request to %s failed with status %d: %s", peerAddr, resp.StatusCode, string(body))
+}
+// =================================================================
+// END OF BUG FIX
+// =================================================================
+
+
+func (n *Node) sendOperation(nodeAddr string, op Operation) error {
+	url := fmt.Sprintf("http://%s/internal/operation", nodeAddr)
+	opBytes, err := json.Marshal(op)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(opBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := n.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("failed to send operation: %s", string(body))
+	}
+	return nil
+}
+
+func (n *Node) sendPut(nodeAddr string, key, value []byte) error {
+	url := fmt.Sprintf("http://%s/kv/%s", nodeAddr, string(key))
 	reqBody := map[string]string{"value": string(value)}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
@@ -387,7 +609,7 @@ func (n *Node) sendPutToLeader(leaderAddr string, key, value []byte) error {
 	return nil
 }
 
-func (n *Node) sendGetToLeader(nodeAddr string, key []byte) ([]byte, error) {
+func (n *Node) sendGet(nodeAddr string, key []byte) ([]byte, error) {
 	url := fmt.Sprintf("http://%s/internal/get/%s", nodeAddr, key)
 	resp, err := n.httpClient.Get(url)
 	if err != nil {
@@ -401,7 +623,6 @@ func (n *Node) sendGetToLeader(nodeAddr string, key []byte) ([]byte, error) {
 	}
 	return ioutil.ReadAll(resp.Body)
 }
-
 
 func (n *Node) Shutdown() error {
 	if n.raft != nil {

@@ -18,11 +18,15 @@ import (
 func main() {
 	// Parse command line flags
 	port := flag.Int("port", 8000, "Port to listen on")
-	dbPath := flag.String("db-path", "", "Path to database file (defaults to ./data/data_<port>.db)")
+	dbPath := flag.String("db-path", "", "Path to database file (defaults to ./data_<port>.db)")
 	dataDir := flag.String("data-dir", "./data", "Directory for node data")
 	clusterMode := flag.Bool("cluster-mode", false, "Enable cluster mode")
 	nodeID := flag.String("node-id", "", "Node ID (defaults to <addr>:<port>)")
 	peers := flag.String("peers", "", "Comma-separated list of peer addresses")
+	consistency := flag.String("consistency", "strong", "Consistency model: strong or eventual")
+	replicaCount := flag.Int("replica-count", 2, "Number of replicas for each key")
+	quorumReads := flag.Bool("quorum-reads", false, "Enable quorum reads")
+	quorumWrites := flag.Bool("quorum-writes", false, "Enable quorum writes")
 	bootstrapLeader := flag.Bool("bootstrap-leader", false, "Bootstrap as a Raft leader")
 	joinPeer := flag.String("join-peer", "", "Leader address to join for Raft cluster")
 	bindAddr := flag.String("bind-addr", "localhost", "Bind address for the node")
@@ -31,11 +35,15 @@ func main() {
 
 	// Set default values
 	if *dbPath == "" {
-		*dbPath = fmt.Sprintf("./data/data_%d.db", *port)
+		*dbPath = fmt.Sprintf("./data_%d.db", *port)
 	}
 
 	if *nodeID == "" {
 		*nodeID = fmt.Sprintf("%s:%d", *bindAddr, *port)
+	}
+
+	if err := os.MkdirAll(*dataDir, 0755); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
 	}
 
 	dbDir := filepath.Dir(*dbPath)
@@ -69,8 +77,11 @@ func main() {
 			BindAddr:      *bindAddr,
 			BindPort:      *port,
 			DataDir:       nodeDataDir,
-			ReplicaCount:  2,
+			ReplicaCount:  *replicaCount,
+			Consistency:   *consistency,
 			KnownPeers:    peersList,
+			QuorumReads:   *quorumReads,
+			QuorumWrites:  *quorumWrites,
 			BootstrapRaft: *bootstrapLeader,
 			JoinPeer:      *joinPeer,
 		}
@@ -87,11 +98,11 @@ func main() {
 		defer node.Shutdown()
 
 		// Create a server for a distributed node
-		srv = server.New(persistentStore, node)
-		log.Printf("Starting distributed key-value store")
+		srv = server.New(persistentStore, node, *consistency)
+		log.Printf("Starting distributed key-value store in %s consistency mode", *consistency)
 	} else {
 		// Create a server for a single node
-		srv = server.New(persistentStore, nil)
+		srv = server.New(persistentStore, nil, "")
 		log.Printf("Starting single-node key-value store")
 	}
 
