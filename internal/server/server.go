@@ -19,12 +19,13 @@ type Server struct {
 }
 
 // New creates a new Server instance.
+// If the node is nil, it runs in single-node mode.
 func New(storage *store.PersistentStore, node *cluster.Node, consistent string) *Server {
 	router := gin.Default()
 
-	// Add CORS middleware to allow the UI to connect, especially during dev
+	// Add CORS middleware to allow the UI to connect
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:8080", "http://localhost:5173"}, // Allow launcher and Svelte dev server
+		AllowOrigins:     []string{"http://localhost:8080"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -60,6 +61,7 @@ func (s *Server) registerRoutes() {
 	if s.isCluster {
 		internal := s.router.Group("/internal")
 		{
+			internal.POST("/operation", s.internalOperationHandler)
 			internal.GET("/get/:key", s.internalGetHandler)
 			internal.GET("/status", s.internalStatusHandler)
 			internal.GET("/version/:key", s.internalVersionHandler)

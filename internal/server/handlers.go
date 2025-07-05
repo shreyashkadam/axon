@@ -16,6 +16,7 @@ type KeyValue struct {
 }
 
 // putHandler handles storing a key-value pair.
+// It delegates to the cluster node if in cluster mode, otherwise writes locally.
 func (s *Server) putHandler(c *gin.Context) {
 	key := c.Param("key")
 	if key == "" {
@@ -110,6 +111,33 @@ func (s *Server) getAllHandler(c *gin.Context) {
 
 // --- Internal Cluster Handlers ---
 
+// internalOperationHandler handles internal operations from other nodes.
+func (s *Server) internalOperationHandler(c *gin.Context) {
+	var op cluster.Operation
+	if err := c.ShouldBindJSON(&op); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	switch op.Type {
+	case cluster.OpPut:
+		if err := s.store.Put(op.Key, op.Value); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	case cluster.OpDelete:
+		if err := s.store.Delete(op.Key); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown operation type"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "success"})
+}
+
 // internalGetHandler handles internal GET requests from other nodes.
 func (s *Server) internalGetHandler(c *gin.Context) {
 	key := c.Param("key")
@@ -118,9 +146,7 @@ func (s *Server) internalGetHandler(c *gin.Context) {
 		return
 	}
 
-	// For strong consistency, a follower node forwards a GET to the leader,
-	// which then reads from its own Raft store. This is a direct read from that store.
-	value, err := s.node.GetRaftStore().Get([]byte(key))
+	value, err := s.store.Get([]byte(key))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
@@ -131,27 +157,11 @@ func (s *Server) internalGetHandler(c *gin.Context) {
 // internalStatusHandler returns the status of the current node.
 func (s *Server) internalStatusHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"node_id":   s.node.ID,
-		"is_leader": s.node.IsLeader(),
+		"node_id":     s.node.ID,
+		"is_leader":   s.node.IsLeader(),
 		"leader_addr": s.node.LeaderAddr(),
+		"consistency": s.consistency,
 	})
-}
-
-// internalVersionHandler returns the version information for a key.
-func (s *Server) internalVersionHandler(c *gin.Context) {
-	key := c.Param("key")
-	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
-		return
-	}
-
-	_, version, err := s.node.GetRaftStore().GetVersioned([]byte(key))
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"version": version})
 }
 
 // RaftJoinRequest represents a request to join a Raft cluster.
@@ -188,7 +198,11 @@ func (s *Server) internalRaftJoinHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "node successfully joined the Raft cluster"})
+	c.JSON(http.StatusOK, gin.H{
+		"success":    true,
+		"message":    "node successfully joined the Raft cluster",
+		"consistent": s.consistency,
+	})
 }
 
 // RaftRemoveRequest represents a request to remove a node from the Raft cluster.
@@ -221,4 +235,21 @@ func (s *Server) internalRaftRemoveHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "removal processed"})
+}
+
+// internalVersionHandler returns the version information for a key.
+func (s *Server) internalVersionHandler(c *gin.Context) {
+	key := c.Param("key")
+	if key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
+		return
+	}
+
+	_, version, err := s.node.GetRaftStore().GetVersioned([]byte(key))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"version": version})
 }
