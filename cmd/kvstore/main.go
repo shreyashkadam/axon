@@ -21,9 +21,11 @@ func main() {
 	dbPath := flag.String("db-path", "", "Path to database file (defaults to ./data/data_<port>.db)")
 	dataDir := flag.String("data-dir", "./data", "Directory for node data")
 	clusterMode := flag.Bool("cluster-mode", false, "Enable cluster mode")
-	nodeID := flag.String("node-id", "", "Node ID (defaults to localhost:<port>)")
+	nodeID := flag.String("node-id", "", "Node ID (defaults to <addr>:<port>)")
 	peers := flag.String("peers", "", "Comma-separated list of peer addresses")
+	bootstrapLeader := flag.Bool("bootstrap-leader", false, "Bootstrap as a Raft leader")
 	bindAddr := flag.String("bind-addr", "localhost", "Bind address for the node")
+
 	flag.Parse()
 
 	// Set default values
@@ -62,12 +64,13 @@ func main() {
 		}
 
 		nodeOpts := cluster.NodeOptions{
-			ID:           *nodeID,
-			BindAddr:     *bindAddr,
-			BindPort:     *port,
-			DataDir:      nodeDataDir,
-			ReplicaCount: 2,
-			KnownPeers:   peersList,
+			ID:            *nodeID,
+			BindAddr:      *bindAddr,
+			BindPort:      *port,
+			DataDir:       nodeDataDir,
+			ReplicaCount:  2,
+			KnownPeers:    peersList,
+			BootstrapRaft: *bootstrapLeader,
 		}
 
 		fsm := cluster.NewFSM(persistentStore)

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/memberlist"
@@ -35,18 +36,20 @@ type Node struct {
 	raftLogStore  *raftboltdb.BoltStore
 	raftStore     *RaftStore
 	raftDir       string
+	BootstrapRaft bool
 	dataDir       string
 	replicaCount  int
 }
 
 // NodeOptions contains options for creating a new node
 type NodeOptions struct {
-	ID           string
-	BindAddr     string
-	BindPort     int
-	DataDir      string
-	ReplicaCount int
-	KnownPeers   []string
+	ID            string
+	BindAddr      string
+	BindPort      int
+	DataDir       string
+	ReplicaCount  int
+	KnownPeers    []string
+	BootstrapRaft bool
 }
 
 // NewNode creates a new node
@@ -56,15 +59,16 @@ func NewNode(opts NodeOptions, fsm *FSM) (*Node, error) {
 	}
 
 	node := &Node{
-		ID:           opts.ID,
-		BindAddr:     opts.BindAddr,
-		BindPort:     opts.BindPort,
-		dataDir:      opts.DataDir,
-		replicaCount: opts.ReplicaCount,
-		hashRing:     consistent.NewRing(10),
-		raftStore:    fsm.raftStore,
-		KnownPeers:   opts.KnownPeers,
-		raftDir:      filepath.Join(opts.DataDir, fmt.Sprintf("node-%s", opts.ID)),
+		ID:            opts.ID,
+		BindAddr:      opts.BindAddr,
+		BindPort:      opts.BindPort,
+		dataDir:       opts.DataDir,
+		replicaCount:  opts.ReplicaCount,
+		hashRing:      consistent.NewRing(10),
+		raftStore:     fsm.raftStore,
+		KnownPeers:    opts.KnownPeers,
+		raftDir:       filepath.Join(opts.DataDir, fmt.Sprintf("node-%s", opts.ID)),
+		BootstrapRaft: opts.BootstrapRaft,
 	}
 
 	if err := os.MkdirAll(node.dataDir, 0755); err != nil {
@@ -131,6 +135,7 @@ func (n *Node) setupRaft(fsm *FSM) error {
 	}
 	n.raftTransport = transport
 
+	n.raftDir = filepath.Join(n.dataDir, fmt.Sprintf("node-%s", n.ID))
 	if err := os.MkdirAll(n.raftDir, 0755); err != nil {
 		return fmt.Errorf("failed to create Raft directory: %w", err)
 	}
@@ -154,6 +159,29 @@ func (n *Node) setupRaft(fsm *FSM) error {
 	n.raft, err = raft.NewRaft(config, fsm, logStore, stableStore, snapshotStore, transport)
 	if err != nil {
 		return fmt.Errorf("failed to create Raft instance: %w", err)
+	}
+
+	if n.BootstrapRaft {
+		log.Printf("Node %s is bootstrapping new Raft cluster as leader", n.ID)
+		peerConfig := raft.Configuration{
+			Servers: []raft.Server{
+				{
+					Suffrage: raft.Voter,
+					ID:       config.LocalID,
+					Address:  transport.LocalAddr(),
+				},
+			},
+		}
+
+		bootstrapFuture := n.raft.BootstrapCluster(peerConfig)
+		if err := bootstrapFuture.Error(); err != nil {
+			log.Printf("Warning: failed to bootstrap Raft cluster: %v", err)
+			if !strings.Contains(err.Error(), "already") {
+				return fmt.Errorf("failed to bootstrap Raft cluster: %w", err)
+			}
+		} else {
+			log.Printf("Successfully bootstrapped Raft cluster as leader")
+		}
 	}
 
 	log.Printf("Raft setup complete for node %s", n.ID)
