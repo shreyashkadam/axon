@@ -24,6 +24,7 @@ func main() {
 	nodeID := flag.String("node-id", "", "Node ID (defaults to <addr>:<port>)")
 	peers := flag.String("peers", "", "Comma-separated list of peer addresses")
 	bootstrapLeader := flag.Bool("bootstrap-leader", false, "Bootstrap as a Raft leader")
+	joinPeer := flag.String("join-peer", "", "Leader address to join for Raft cluster")
 	bindAddr := flag.String("bind-addr", "localhost", "Bind address for the node")
 
 	flag.Parse()
@@ -71,6 +72,7 @@ func main() {
 			ReplicaCount:  2,
 			KnownPeers:    peersList,
 			BootstrapRaft: *bootstrapLeader,
+			JoinPeer:      *joinPeer,
 		}
 
 		fsm := cluster.NewFSM(persistentStore)

@@ -1,8 +1,12 @@
 package cluster
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +41,8 @@ type Node struct {
 	raftStore     *RaftStore
 	raftDir       string
 	BootstrapRaft bool
+	JoinPeer      string
+	httpClient    *http.Client
 	dataDir       string
 	replicaCount  int
 }
@@ -50,6 +56,7 @@ type NodeOptions struct {
 	ReplicaCount  int
 	KnownPeers    []string
 	BootstrapRaft bool
+	JoinPeer      string
 }
 
 // NewNode creates a new node
@@ -65,10 +72,14 @@ func NewNode(opts NodeOptions, fsm *FSM) (*Node, error) {
 		dataDir:       opts.DataDir,
 		replicaCount:  opts.ReplicaCount,
 		hashRing:      consistent.NewRing(10),
+		httpClient: &http.Client{
+			Timeout: 2 * time.Second,
+		},
 		raftStore:     fsm.raftStore,
 		KnownPeers:    opts.KnownPeers,
 		raftDir:       filepath.Join(opts.DataDir, fmt.Sprintf("node-%s", opts.ID)),
 		BootstrapRaft: opts.BootstrapRaft,
+		JoinPeer:      opts.JoinPeer,
 	}
 
 	if err := os.MkdirAll(node.dataDir, 0755); err != nil {
@@ -182,10 +193,57 @@ func (n *Node) setupRaft(fsm *FSM) error {
 		} else {
 			log.Printf("Successfully bootstrapped Raft cluster as leader")
 		}
+	} else if n.JoinPeer != "" {
+		go func() {
+			time.Sleep(3 * time.Second) // Give some time for the leader to be ready
+			log.Printf("Node %s attempting to join cluster via peer %s", n.ID, n.JoinPeer)
+			if err := n.joinRaftCluster(n.JoinPeer); err != nil {
+				log.Printf("Error joining cluster: %v", err)
+			}
+		}()
 	}
 
 	log.Printf("Raft setup complete for node %s", n.ID)
 	return nil
+}
+
+func (n *Node) joinRaftCluster(peerAddr string) error {
+	localRaftAddr := fmt.Sprintf("%s:%d", n.BindAddr, n.BindPort+2)
+	joinRequest := struct {
+		NodeID   string `json:"node_id"`
+		RaftAddr string `json:"raft_addr"`
+	}{
+		NodeID:   n.ID,
+		RaftAddr: localRaftAddr,
+	}
+
+	joinData, err := json.Marshal(joinRequest)
+	if err != nil {
+		return fmt.Errorf("failed to marshal join request: %w", err)
+	}
+
+	joinURL := fmt.Sprintf("http://%s/internal/raft/join", peerAddr)
+	resp, err := n.httpClient.Post(joinURL, "application/json", bytes.NewBuffer(joinData))
+	if err != nil {
+		return fmt.Errorf("failed to send join request to %s: %w", peerAddr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("join request to %s failed with status %d: %s", peerAddr, resp.StatusCode, string(body))
+	}
+
+	log.Printf("Successfully joined cluster via %s", peerAddr)
+	return nil
+}
+
+func (n *Node) IsLeader() bool {
+	return n.raft.State() == raft.Leader
+}
+
+func (n *Node) GetRaft() *raft.Raft {
+	return n.raft
 }
 
 func (n *Node) Shutdown() error {
