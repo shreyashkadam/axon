@@ -14,6 +14,7 @@ type KeyValue struct {
 }
 
 // putHandler handles storing a key-value pair.
+// It delegates to the cluster node if in cluster mode, otherwise writes locally.
 func (s *Server) putHandler(c *gin.Context) {
 	key := c.Param("key")
 	if key == "" {
@@ -29,8 +30,7 @@ func (s *Server) putHandler(c *gin.Context) {
 
 	var err error
 	if s.isCluster {
-		// Cluster logic will be added here
-		err = s.store.Put([]byte(key), []byte(kv.Value))
+		err = s.node.Put([]byte(key), []byte(kv.Value))
 	} else {
 		err = s.store.Put([]byte(key), []byte(kv.Value))
 	}
@@ -94,6 +94,7 @@ func (s *Server) deleteHandler(c *gin.Context) {
 
 // getAllHandler retrieves all key-value pairs from the local store.
 func (s *Server) getAllHandler(c *gin.Context) {
+	// Note: This always queries the local node's store.
 	values, err := s.store.GetAll()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -118,8 +119,15 @@ type RaftJoinRequest struct {
 
 // internalRaftJoinHandler handles requests from nodes to join the Raft cluster.
 func (s *Server) internalRaftJoinHandler(c *gin.Context) {
-	if s.node.GetRaft().State() != raft.Leader {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "not the leader"})
+	if !s.node.IsLeader() {
+		leaderAddr := s.node.LeaderAddr()
+		if leaderAddr == "" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "not leader and no leader available"})
+			return
+		}
+		// Redirect to leader
+		c.Header("Location", "http://"+leaderAddr+c.Request.URL.Path)
+		c.JSON(http.StatusTemporaryRedirect, gin.H{"error": "not the leader", "leader_addr": leaderAddr})
 		return
 	}
 

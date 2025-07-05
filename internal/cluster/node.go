@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,14 +67,14 @@ func NewNode(opts NodeOptions, fsm *FSM) (*Node, error) {
 	}
 
 	node := &Node{
-		ID:            opts.ID,
-		BindAddr:      opts.BindAddr,
-		BindPort:      opts.BindPort,
-		dataDir:       opts.DataDir,
-		replicaCount:  opts.ReplicaCount,
-		hashRing:      consistent.NewRing(10),
+		ID:           opts.ID,
+		BindAddr:     opts.BindAddr,
+		BindPort:     opts.BindPort,
+		dataDir:      opts.DataDir,
+		replicaCount: opts.ReplicaCount,
+		hashRing:     consistent.NewRing(10),
 		httpClient: &http.Client{
-			Timeout: 2 * time.Second,
+			Timeout: 5 * time.Second,
 		},
 		raftStore:     fsm.raftStore,
 		KnownPeers:    opts.KnownPeers,
@@ -195,7 +196,7 @@ func (n *Node) setupRaft(fsm *FSM) error {
 		}
 	} else if n.JoinPeer != "" {
 		go func() {
-			time.Sleep(3 * time.Second) // Give some time for the leader to be ready
+			time.Sleep(3 * time.Second)
 			log.Printf("Node %s attempting to join cluster via peer %s", n.ID, n.JoinPeer)
 			if err := n.joinRaftCluster(n.JoinPeer); err != nil {
 				log.Printf("Error joining cluster: %v", err)
@@ -242,8 +243,94 @@ func (n *Node) IsLeader() bool {
 	return n.raft.State() == raft.Leader
 }
 
+func (n *Node) LeaderAddr() string {
+	if n.raft == nil {
+		return ""
+	}
+
+	raftLeaderAddr := string(n.raft.Leader())
+	if raftLeaderAddr == "" {
+		return ""
+	}
+
+	parts := strings.Split(raftLeaderAddr, ":")
+	if len(parts) != 2 {
+		return raftLeaderAddr
+	}
+
+	host := parts[0]
+	port, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return raftLeaderAddr
+	}
+
+	// Convert Raft port back to API port
+	httpPort := port - 2
+	httpAddr := fmt.Sprintf("%s:%d", host, httpPort)
+
+	return httpAddr
+}
+
 func (n *Node) GetRaft() *raft.Raft {
 	return n.raft
+}
+
+func (n *Node) Put(key, value []byte) error {
+	log.Printf("Put request for key: %s", string(key))
+
+	isLeader := n.IsLeader()
+	leaderAddr := n.LeaderAddr()
+	log.Printf("Local node leader status: %v, Leader address: %s", isLeader, leaderAddr)
+
+	if !isLeader {
+		if leaderAddr == "" {
+			return fmt.Errorf("no leader available for put")
+		}
+		log.Printf("Forwarding put request to leader at %s", leaderAddr)
+		return n.sendPutToLeader(leaderAddr, key, value)
+	}
+
+	log.Printf("We are the Raft leader, storing key %s via Raft consensus", string(key))
+	op := Operation{Type: OpPut, Key: key, Value: value}
+	opData, err := json.Marshal(op)
+	if err != nil {
+		return fmt.Errorf("failed to marshal operation: %w", err)
+	}
+
+	applyFuture := n.raft.Apply(opData, raftTimeout)
+	if err := applyFuture.Error(); err != nil {
+		log.Printf("Failed to apply operation to Raft: %v", err)
+		return fmt.Errorf("failed to apply operation to Raft: %w", err)
+	}
+	log.Printf("Successfully stored key %s", string(key))
+	return nil
+}
+
+func (n *Node) sendPutToLeader(leaderAddr string, key, value []byte) error {
+	url := fmt.Sprintf("http://%s/kv/%s", leaderAddr, string(key))
+	reqBody := map[string]string{"value": string(value)}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := n.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("failed to send put: %s", string(body))
+	}
+	return nil
 }
 
 func (n *Node) Shutdown() error {
