@@ -2,16 +2,29 @@
   import { onMount } from 'svelte';
   import { getManagedNodes } from '$lib/api.js';
   import ClusterDashboard from '$lib/components/ClusterDashboard.svelte';
+  import KeyValueExplorer from '$lib/components/KeyValueExplorer.svelte';
 
   let nodes = [];
+  let selectedNodePort = null;
+  let explorerState = { key: '', value: '' };
 
   const fetchNodes = async () => {
     try {
       const res = await getManagedNodes();
-      nodes = Object.values(res.data).sort((a, b) => a.id.localeCompare(b.id));
+      const managedNodes = Object.values(res.data).sort((a, b) => a.id.localeCompare(b.id));
+      nodes = managedNodes;
+
+      const onlineNodes = managedNodes.filter(n => n.status === 'online');
+
+      if (!selectedNodePort && onlineNodes.length > 0) {
+        selectedNodePort = onlineNodes[0].api_port;
+      } else if (onlineNodes.length === 0) {
+        selectedNodePort = null;
+      }
     } catch (error) {
       console.error("Failed to fetch managed nodes:", error);
       nodes = [];
+      selectedNodePort = null;
     }
   };
 
@@ -28,6 +41,16 @@
   </header>
 
   <main>
-    <ClusterDashboard {nodes} />
+    <div class="mb-8">
+      <ClusterDashboard {nodes} />
+    </div>
+    
+    <div class="bg-white p-6 rounded-lg shadow-md">
+        <KeyValueExplorer
+            {nodes}
+            bind:selectedNodePort
+            bind:explorerState
+        />
+    </div>
   </main>
 </div>
