@@ -11,6 +11,7 @@ require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	go.etcd.io/bbolt v1.4.0
+	github.com/gin-contrib/cors v1.7.2
 )
 
 require (

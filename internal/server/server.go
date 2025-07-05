@@ -1,6 +1,9 @@
 package server
 
 import (
+	"time"
+
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"kvstore/internal/cluster"
 	"kvstore/internal/store"
@@ -8,21 +11,33 @@ import (
 
 // Server holds all dependencies for the HTTP server.
 type Server struct {
-	store     store.Store
-	node      *cluster.Node
-	router    *gin.Engine
-	isCluster bool
+	store       *store.PersistentStore
+	node        *cluster.Node
+	router      *gin.Engine
+	isCluster   bool
+	consistency string
 }
 
 // New creates a new Server instance.
-func New(storage store.Store, node *cluster.Node) *Server {
+func New(storage *store.PersistentStore, node *cluster.Node, consistent string) *Server {
 	router := gin.Default()
 
+	// Add CORS middleware to allow the UI to connect, especially during dev
+	router.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"http://localhost:8080", "http://localhost:5173"}, // Allow launcher and Svelte dev server
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}))
+
 	s := &Server{
-		store:     storage,
-		node:      node,
-		router:    router,
-		isCluster: (node != nil),
+		store:       storage,
+		node:        node,
+		router:      router,
+		isCluster:   (node != nil),
+		consistency: consistent,
 	}
 
 	s.registerRoutes()
