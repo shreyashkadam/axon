@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -23,6 +24,7 @@ const portStep = 10
 type NodeConfig struct {
 	ID      string `json:"id"`
 	APIPort int    `json:"api_port"`
+	BindAddr string `json:"-"`
 }
 
 // NodeProcess holds the state for a running node process.
@@ -37,6 +39,7 @@ type NodeManager struct {
 	nodes        map[string]*NodeProcess
 	allConfigs   map[string]NodeConfig
 	kvBinary     string
+	httpClient   *http.Client
 	nextBasePort int
 }
 
@@ -45,22 +48,16 @@ func NewNodeManager(kvBinary string) *NodeManager {
 		nodes:        make(map[string]*NodeProcess),
 		allConfigs:   make(map[string]NodeConfig),
 		kvBinary:     kvBinary,
+		httpClient:   &http.Client{Timeout: 2 * time.Second},
 		nextBasePort: basePort,
 	}
 }
 
 func (nm *NodeManager) findFreePort() (int, error) {
-	for i := 0; i < 100; i++ {
-		port := nm.nextBasePort
-		nm.nextBasePort += portStep
-
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-		if err == nil {
-			l.Close()
-			return port, nil
-		}
-	}
-	return 0, fmt.Errorf("could not find a free port")
+	// Simplified port finding
+	port := nm.nextBasePort
+	nm.nextBasePort += portStep
+	return port, nil
 }
 
 func (nm *NodeManager) AddNewNode(nodeID string) (NodeConfig, error) {
@@ -77,15 +74,14 @@ func (nm *NodeManager) AddNewNode(nodeID string) (NodeConfig, error) {
 	}
 
 	config := NodeConfig{
-		ID:      nodeID,
-		APIPort: apiPort,
+		ID:       nodeID,
+		APIPort:  apiPort,
+		BindAddr: "127.0.0.1",
 	}
 
 	nm.allConfigs[config.ID] = config
 
-	// The actual start is now handled via API, but we'll prime the first few
-	// in main for simplicity.
-	// go nm.startNode(config, false, "127.0.0.1:9000")
+	go nm.startNewNodeProcess(config)
 
 	return config, nil
 }
@@ -111,7 +107,7 @@ func (nm *NodeManager) startNode(config NodeConfig, bootstrap bool, joinPeer str
 		"--node-id", config.ID,
 		"--data-dir", dataDir,
 		"--cluster-mode",
-		"--bind-addr", "127.0.0.1",
+		"--bind-addr", config.BindAddr,
 	}
 
 	if bootstrap {
@@ -156,11 +152,98 @@ func (nm *NodeManager) StopNode(nodeID string) error {
 	log.Printf("Sending stop signal to node %s...", nodeID)
 	if err := proc.Cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		if runtime.GOOS == "windows" {
-			// Fallback for Windows
 			_ = proc.Cmd.Process.Kill()
 		}
 	}
 	return nil
+}
+
+func (nm *NodeManager) FindCurrentLeader() (string, error) {
+	nm.mu.RLock()
+	nodesToCheck := make([]NodeConfig, 0, len(nm.nodes))
+	for _, proc := range nm.nodes {
+		nodesToCheck = append(nodesToCheck, proc.Config)
+	}
+	nm.mu.RUnlock()
+
+	if len(nodesToCheck) == 0 {
+		return "", fmt.Errorf("no running nodes")
+	}
+
+	for _, cfg := range nodesToCheck {
+		url := fmt.Sprintf("http://%s:%d/internal/status", cfg.BindAddr, cfg.APIPort)
+		resp, err := nm.httpClient.Get(url)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		var status struct {
+			LeaderAddr string `json:"leader_addr"`
+			IsLeader   bool   `json:"is_leader"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&status) == nil {
+			if status.IsLeader {
+				return fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.APIPort), nil
+			}
+			if status.LeaderAddr != "" {
+				return status.LeaderAddr, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("could not determine leader")
+}
+
+func (nm *NodeManager) startNewNodeProcess(config NodeConfig) {
+	joinPeer, err := nm.FindCurrentLeader()
+	bootstrap := false
+	if err != nil {
+		log.Printf("Could not find leader. This node might bootstrap if it's the first one.")
+		nm.mu.RLock()
+		if len(nm.allConfigs) == 1 {
+			bootstrap = true
+		}
+		nm.mu.RUnlock()
+	}
+
+	if err := nm.startNode(config, bootstrap, joinPeer); err != nil {
+		log.Printf("ERROR starting node %s: %v", config.ID, err)
+		nm.mu.Lock()
+		delete(nm.allConfigs, config.ID)
+		nm.mu.Unlock()
+	}
+}
+
+func (nm *NodeManager) GetAllNodeStatuses() map[string]interface{} {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	statuses := make(map[string]interface{})
+	for id, cfg := range nm.allConfigs {
+		baseStatus := map[string]interface{}{
+			"id":        id,
+			"api_port":  cfg.APIPort,
+			"status":    "offline",
+			"is_leader": false,
+		}
+
+		if _, running := nm.nodes[id]; running {
+			url := fmt.Sprintf("http://%s:%d/internal/status", cfg.BindAddr, cfg.APIPort)
+			resp, err := nm.httpClient.Get(url)
+			if err == nil {
+				defer resp.Body.Close()
+				var raftStatus struct {
+					IsLeader bool `json:"is_leader"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&raftStatus) == nil {
+					baseStatus["status"] = "online"
+					baseStatus["is_leader"] = raftStatus.IsLeader
+				}
+			}
+		}
+		statuses[id] = baseStatus
+	}
+	return statuses
 }
 
 func (nm *NodeManager) StopAll() {
@@ -193,34 +276,25 @@ func main() {
 
 	manager := NewNodeManager("./" + kvstoreBinaryName)
 
-	// --- Initial Cluster Setup ---
-	initialConfigs := []NodeConfig{}
 	for i := 1; i <= 3; i++ {
-		config, err := manager.AddNewNode(fmt.Sprintf("node%d", i))
+		_, err := manager.AddNewNode(fmt.Sprintf("node%d", i))
 		if err != nil {
-			log.Fatalf("Failed to create initial node config: %v", err)
+			log.Fatalf("Failed to create initial node: %v", err)
 		}
-		initialConfigs = append(initialConfigs, config)
-	}
-
-	if err := manager.startNode(initialConfigs[0], true, ""); err != nil {
-		log.Fatalf("Failed to start node1: %v", err)
-	}
-	time.Sleep(5 * time.Second)
-
-	leaderAPIPeer := fmt.Sprintf("127.0.0.1:%d", initialConfigs[0].APIPort)
-	for i := 1; i < len(initialConfigs); i++ {
-		if err := manager.startNode(initialConfigs[i], false, leaderAPIPeer); err != nil {
-			log.Fatalf("Failed to start node %s: %v", initialConfigs[i].ID, err)
+		if i == 1 {
+			time.Sleep(5 * time.Second)
+		} else {
+			time.Sleep(2 * time.Second)
 		}
-		time.Sleep(2 * time.Second)
 	}
-	// --- End Initial Setup ---
 
 	gin.SetMode(gin.ReleaseMode)
 	apiRouter := gin.New()
 	api := apiRouter.Group("/api/control")
 	{
+		api.GET("/nodes", func(c *gin.Context) {
+			c.JSON(http.StatusOK, manager.GetAllNodeStatuses())
+		})
 		api.POST("/add", func(c *gin.Context) {
 			var req struct {
 				NodeID string `json:"node_id"`
@@ -253,8 +327,7 @@ func main() {
 				c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
 				return
 			}
-			// For now, new nodes always join the first node. This will be improved.
-			go manager.startNode(config, false, "127.0.0.1:9000")
+			go manager.startNewNodeProcess(config)
 			c.JSON(http.StatusOK, gin.H{"status": "start signal sent"})
 		})
 	}
