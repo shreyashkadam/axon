@@ -9,10 +9,12 @@
 
   let response = { text: '{ "status": "Awaiting operation..." }', type: 'info' };
   let isLoading = false;
+  let loadingAction = '';
 
-  const handleAction = async (actionFn) => {
+  const handleAction = async (actionFn, actionName) => {
     if (!selectedNodePort || isLoading) return;
     isLoading = true;
+    loadingAction = actionName;
     response = { text: '{ "status": "Processing..." }', type: 'info' };
     try {
       const res = await actionFn();
@@ -21,6 +23,7 @@
       response = { text: JSON.stringify(error.response?.data || { error: error.message }, null, 2), type: 'error' };
     } finally {
       isLoading = false;
+      loadingAction = '';
     }
   };
 </script>
@@ -31,26 +34,28 @@
   <div class="space-y-4">
     <div>
       <label for="kv-key" class="block text-sm font-medium text-slate-700">Key</label>
-      <input id="kv-key" type="text" bind:value={explorerState.key} class="mt-1 block w-full rounded-md border-slate-300 shadow-sm" />
+      <input id="kv-key" type="text" bind:value={explorerState.key} class="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50" />
     </div>
     <div>
       <label for="kv-value" class="block text-sm font-medium text-slate-700">Value</label>
-      <textarea id="kv-value" bind:value={explorerState.value} rows="4" class="mt-1 block w-full rounded-md border-slate-300 shadow-sm"></textarea>
+      <textarea id="kv-value" bind:value={explorerState.value} rows="4" class="mt-1 block w-full rounded-md border-slate-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50"></textarea>
     </div>
   </div>
   <div class="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
-    <button on:click={() => handleAction(() => getKey(selectedNodePort, explorerState.key))} disabled={isLoading || !explorerState.key} class="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md disabled:bg-slate-300">
-      GET
+    <button on:click={() => handleAction(() => getKey(selectedNodePort, explorerState.key), 'GET')} disabled={isLoading || !explorerState.key} class="flex justify-center items-center gap-2 w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md shadow-sm transition-colors disabled:bg-slate-300">
+      {#if isLoading && loadingAction === 'GET'} <Icon icon="codicon:loading" class="animate-spin"/> {:else} <Icon icon="codicon:search" /> {/if} GET
     </button>
-    <button on:click={() => handleAction(() => putKey(selectedNodePort, explorerState.key, explorerState.value))} disabled={isLoading || !explorerState.key} class="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-md disabled:bg-slate-300">
-      PUT
+    <button on:click={() => handleAction(() => putKey(selectedNodePort, explorerState.key, explorerState.value), 'PUT')} disabled={isLoading || !explorerState.key} class="flex justify-center items-center gap-2 w-full bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-md shadow-sm transition-colors disabled:bg-slate-300">
+        {#if isLoading && loadingAction === 'PUT'} <Icon icon="codicon:loading" class="animate-spin"/> {:else} <Icon icon="codicon:save" /> {/if} PUT
     </button>
-    <button on:click={() => handleAction(() => deleteKey(selectedNodePort, explorerState.key))} disabled={isLoading || !explorerState.key} class="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-md disabled:bg-slate-300">
-      DELETE
+    <button on:click={() => handleAction(() => deleteKey(selectedNodePort, explorerState.key), 'DELETE')} disabled={isLoading || !explorerState.key} class="flex justify-center items-center gap-2 w-full bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-md shadow-sm transition-colors disabled:bg-slate-300">
+        {#if isLoading && loadingAction === 'DELETE'} <Icon icon="codicon:loading" class="animate-spin"/> {:else} <Icon icon="codicon:trash" /> {/if} DELETE
     </button>
   </div>
-  <div class="mt-4 flex-grow">
-    <span class="block text-sm font-medium text-slate-700">Response</span>
-    <pre class="mt-1 p-4 rounded-md text-sm bg-slate-100 overflow-auto h-40"><code>{response.text}</code></pre>
+  <div class="mt-4 flex-grow flex flex-col">
+      <span class="block text-sm font-medium text-slate-700">Response</span>
+      <div class="mt-1 p-1 rounded-md text-sm overflow-auto h-40 bg-slate-50 border">
+          <pre class="p-4 m-0 h-full bg-slate-50 text-sm whitespace-pre-wrap"><code>{response.text}</code></pre>
+      </div>
   </div>
 </div>
