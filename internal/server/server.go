@@ -15,7 +15,6 @@ type Server struct {
 }
 
 // New creates a new Server instance.
-// If the node is nil, it runs in single-node mode.
 func New(storage store.Store, node *cluster.Node) *Server {
 	router := gin.Default()
 
@@ -46,6 +45,10 @@ func (s *Server) registerRoutes() {
 	if s.isCluster {
 		internal := s.router.Group("/internal")
 		{
+			internal.GET("/get/:key", s.internalGetHandler)
+			internal.GET("/status", s.internalStatusHandler)
+			internal.GET("/version/:key", s.internalVersionHandler)
+
 			raftGroup := internal.Group("/raft")
 			{
 				raftGroup.POST("/join", s.internalRaftJoinHandler)

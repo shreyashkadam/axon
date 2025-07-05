@@ -264,7 +264,6 @@ func (n *Node) LeaderAddr() string {
 		return raftLeaderAddr
 	}
 
-	// Convert Raft port back to API port
 	httpPort := port - 2
 	httpAddr := fmt.Sprintf("%s:%d", host, httpPort)
 
@@ -275,14 +274,15 @@ func (n *Node) GetRaft() *raft.Raft {
 	return n.raft
 }
 
+func (n *Node) GetRaftStore() *RaftStore {
+	return n.raftStore
+}
+
 func (n *Node) Put(key, value []byte) error {
 	log.Printf("Put request for key: %s", string(key))
 
-	isLeader := n.IsLeader()
-	leaderAddr := n.LeaderAddr()
-	log.Printf("Local node leader status: %v, Leader address: %s", isLeader, leaderAddr)
-
-	if !isLeader {
+	if !n.IsLeader() {
+		leaderAddr := n.LeaderAddr()
 		if leaderAddr == "" {
 			return fmt.Errorf("no leader available for put")
 		}

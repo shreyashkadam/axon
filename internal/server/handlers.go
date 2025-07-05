@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/hashicorp/raft"
+	"kvstore/internal/cluster"
 )
 
 // KeyValue represents the JSON payload for a PUT request.
@@ -14,7 +15,6 @@ type KeyValue struct {
 }
 
 // putHandler handles storing a key-value pair.
-// It delegates to the cluster node if in cluster mode, otherwise writes locally.
 func (s *Server) putHandler(c *gin.Context) {
 	key := c.Param("key")
 	if key == "" {
@@ -54,7 +54,7 @@ func (s *Server) getHandler(c *gin.Context) {
 	var value []byte
 	var err error
 	if s.isCluster {
-		// Cluster logic will be added here
+		// Cluster logic will be added in a later commit
 		value, err = s.store.Get([]byte(key))
 	} else {
 		value, err = s.store.Get([]byte(key))
@@ -94,7 +94,6 @@ func (s *Server) deleteHandler(c *gin.Context) {
 
 // getAllHandler retrieves all key-value pairs from the local store.
 func (s *Server) getAllHandler(c *gin.Context) {
-	// Note: This always queries the local node's store.
 	values, err := s.store.GetAll()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -111,6 +110,51 @@ func (s *Server) getAllHandler(c *gin.Context) {
 
 // --- Internal Cluster Handlers ---
 
+// internalGetHandler handles internal GET requests from other nodes.
+func (s *Server) internalGetHandler(c *gin.Context) {
+	key := c.Param("key")
+	if key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
+		return
+	}
+
+	// This is a direct read from the local persistent store, not the Raft store.
+	// Used for replication in eventual consistency or follower reads.
+	value, err := s.store.Get([]byte(key))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.Data(http.StatusOK, "application/octet-stream", value)
+}
+
+// internalStatusHandler returns the status of the current node.
+func (s *Server) internalStatusHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"node_id":   s.node.ID,
+		"is_leader": s.node.IsLeader(),
+		"leader_addr": s.node.LeaderAddr(),
+	})
+}
+
+// internalVersionHandler returns the version information for a key.
+func (s *Server) internalVersionHandler(c *gin.Context) {
+	key := c.Param("key")
+	if key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
+		return
+	}
+
+	_, version, err := s.node.GetRaftStore().GetVersioned([]byte(key))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"version": version})
+}
+
+
 // RaftJoinRequest represents a request to join a Raft cluster.
 type RaftJoinRequest struct {
 	NodeID   string `json:"node_id"`
@@ -125,8 +169,6 @@ func (s *Server) internalRaftJoinHandler(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "not leader and no leader available"})
 			return
 		}
-		// Redirect to leader
-		c.Header("Location", "http://"+leaderAddr+c.Request.URL.Path)
 		c.JSON(http.StatusTemporaryRedirect, gin.H{"error": "not the leader", "leader_addr": leaderAddr})
 		return
 	}
