@@ -196,10 +196,27 @@ func (n *Node) setupRaft(fsm *FSM) error {
 		}
 	} else if n.JoinPeer != "" {
 		go func() {
-			time.Sleep(3 * time.Second)
-			log.Printf("Node %s attempting to join cluster via peer %s", n.ID, n.JoinPeer)
-			if err := n.joinRaftCluster(n.JoinPeer); err != nil {
-				log.Printf("Error joining cluster: %v", err)
+			log.Printf("Node %s starting join process to peer %s", n.ID, n.JoinPeer)
+			ticker := time.NewTicker(5 * time.Second) // Retry every 5 seconds
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					// If we have a leader, it means we have successfully joined the cluster.
+					if n.raft.Leader() != "" {
+						log.Printf("Node %s has detected a leader. Join process complete.", n.ID)
+						return // Exit the goroutine
+					}
+
+					log.Printf("Node %s attempting to join cluster via peer %s...", n.ID, n.JoinPeer)
+					err := n.joinRaftCluster(n.JoinPeer)
+					if err != nil {
+						log.Printf("Join attempt for node %s failed: %v. Will retry.", n.ID, err)
+					} else {
+						log.Printf("Node %s successfully SENT join request. Waiting for confirmation...", n.ID)
+					}
+				}
 			}
 		}()
 	}
@@ -230,13 +247,24 @@ func (n *Node) joinRaftCluster(peerAddr string) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("join request to %s failed with status %d: %s", peerAddr, resp.StatusCode, string(body))
+	if resp.StatusCode == http.StatusOK {
+		return nil // Success!
 	}
 
-	log.Printf("Successfully joined cluster via %s", peerAddr)
-	return nil
+	// If we were redirected, we need to update our JoinPeer to the new leader address.
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		var redirectInfo struct {
+			LeaderAddr string `json:"leader_addr"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&redirectInfo); err == nil && redirectInfo.LeaderAddr != "" {
+			log.Printf("Join target %s is not leader. Redirected to leader at %s.", peerAddr, redirectInfo.LeaderAddr)
+			n.JoinPeer = redirectInfo.LeaderAddr // Update so the next retry hits the correct leader.
+			return fmt.Errorf("redirected to new leader: %s", redirectInfo.LeaderAddr)
+		}
+	}
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	return fmt.Errorf("join request to %s failed with status %d: %s", peerAddr, resp.StatusCode, string(body))
 }
 
 func (n *Node) IsLeader() bool {
