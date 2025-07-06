@@ -103,25 +103,142 @@ In a dynamic cluster, a new node might try to join while the leader is temporari
 
 ## 💻 API Usage
 
-While the UI is the primary way to interact with the cluster, you can also use the REST API directly. The API port for each node is visible in the dashboard.
+While the UI is the primary way to interact with the cluster, you can also use the REST API directly with tools like `curl`.
+
+### Public Key-Value API
+
+These endpoints can be called on **any active node** in the cluster. If you call a follower node, your request will be automatically forwarded to the leader. Replace `9000` with the API port of any online node.
 
 #### Put a Key-Value Pair
 
+Stores or updates a value for a given key.
+
+  - **Method:** `PUT`
+  - **Path:** `/kv/:key`
+  - **Body:** JSON object with a `value` field.
+
+<!-- end list -->
+
 ```bash
-# Replace 9000 with the API port of any online node
-curl -X PUT -H "Content-Type: application/json" -d '{"value":"hello world"}' http://localhost:9000/kv/my-key
+curl -X PUT -H "Content-Type: application/json" \
+  -d '{"value":"is a distributed systems algorithm"}' \
+  http://localhost:9000/kv/raft
 ```
 
 #### Get a Key
 
+Retrieves the value for a given key.
+
+  - **Method:** `GET`
+  - **Path:** `/kv/:key`
+
+<!-- end list -->
+
 ```bash
-curl http://localhost:9000/kv/my-key
+curl http://localhost:9000/kv/raft
 ```
 
 #### Delete a Key
 
+Removes a key and its value from the store.
+
+  - **Method:** `DELETE`
+  - **Path:** `/kv/:key`
+
+<!-- end list -->
+
 ```bash
-curl -X DELETE http://localhost:9000/kv/my-key
+curl -X DELETE http://localhost:9000/kv/raft
+```
+
+#### Get All Keys
+
+Retrieves all key-value pairs from the store. Note: This reads from the local state of the queried node.
+
+  - **Method:** `GET`
+  - **Path:** `/kv`
+
+<!-- end list -->
+
+```bash
+curl http://localhost:9000/kv
 ```
 
 -----
+
+### Launcher Control API
+
+These endpoints are called on the **launcher application** (running on port `8080`) to manage the node processes and the cluster's configuration.
+
+#### Get All Node Statuses
+
+Returns a list of all configured nodes and their current status (online/offline, leader/follower).
+
+  - **Method:** `GET`
+  - **Path:** `/api/control/nodes`
+
+<!-- end list -->
+
+```bash
+curl http://localhost:8080/api/control/nodes
+```
+
+#### Add a New Node
+
+Dynamically adds a new node to the cluster. The launcher assigns it the next available ports, starts the process, and instructs it to join the cluster leader.
+
+  - **Method:** `POST`
+    \--   **Path:** `/api/control/add`
+  - **Body:** JSON object with a `node_id` field.
+
+<!-- end list -->
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"node_id":"node5"}' \
+  http://localhost:8080/api/control/add
+```
+
+#### Stop a Node
+
+Stops a running node process gracefully.
+
+  - **Method:** `POST`
+  - **Path:** `/api/control/stop/:nodeID`
+
+<!-- end list -->
+
+```bash
+curl -X POST http://localhost:8080/api/control/stop/node5
+```
+
+#### Start a Node
+
+Restarts a stopped node. The node will attempt to rejoin the cluster.
+
+  - **Method:** `POST`
+  - **Path:** `/api/control/start/:nodeID`
+
+<!-- end list -->
+
+```bash
+curl -X POST http://localhost:8080/api/control/start/node5
+```
+
+#### Decommission a Node
+
+Permanently removes a node from the cluster configuration. The launcher will tell the leader to remove the node from the consensus group, stop the process, and delete its data directory.
+
+  - **Method:** `POST`
+  - **Path:** `/api/control/delete/:nodeID`
+
+<!-- end list -->
+
+```bash
+curl -X POST http://localhost:8080/api/control/delete/node5
+```
+-----
+
+### 🚀 Application in Action
+
+![A demo of the Axon dashboard showing node management and leader election.](./demo/axon-client.gif)
